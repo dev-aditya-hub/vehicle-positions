@@ -23,6 +23,10 @@ services:
       PORT: "8080"
       DATABASE_URL: "postgres://postgres:postgres@db:5432/vehicle_positions?sslmode=disable"
       STALENESS_THRESHOLD: "5m"
+      # Required by main.go, which exits if it is unset or shorter than 32
+      # bytes. This default exists so `make up` works out of the box; it is a
+      # well-known value and must be overridden for anything but local dev.
+      JWT_SECRET: "${JWT_SECRET:-local-development-only-insecure-secret}"
     depends_on:
       db:
         condition: service_healthy

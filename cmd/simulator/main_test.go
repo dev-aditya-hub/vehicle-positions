@@ -214,6 +214,7 @@ func TestSendReport_Success(t *testing.T) {
 		assert.Equal(t, http.MethodPost, r.Method)
 		assert.Equal(t, "/api/v1/locations", r.URL.Path)
 		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
+		assert.Equal(t, "Bearer test-token", r.Header.Get("Authorization"))
 		w.WriteHeader(http.StatusCreated)
 	}))
 	defer server.Close()
@@ -229,7 +230,7 @@ func TestSendReport_Success(t *testing.T) {
 		Timestamp: time.Now().Unix(),
 	}
 
-	sendReport(context.Background(), server.Client(), server.URL, "test-vehicle", report, s)
+	sendReport(context.Background(), server.Client(), server.URL, "test-token", "test-vehicle", report, s)
 
 	assert.Equal(t, int64(1), s.succeeded.Load())
 	assert.Equal(t, int64(0), s.failed.Load())
@@ -251,10 +252,100 @@ func TestSendReport_ServerError(t *testing.T) {
 		Timestamp: time.Now().Unix(),
 	}
 
-	sendReport(context.Background(), server.Client(), server.URL, "test-vehicle", report, s)
+	sendReport(context.Background(), server.Client(), server.URL, "test-token", "test-vehicle", report, s)
 
 	assert.Equal(t, int64(0), s.succeeded.Load())
 	assert.Equal(t, int64(1), s.failed.Load())
+}
+
+func TestSendReport_Unauthorized(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"invalid token"}`))
+	}))
+	defer server.Close()
+
+	s := &stats{}
+	report := &locationReport{
+		VehicleID: "test-vehicle",
+		Latitude:  -1.2864,
+		Longitude: 36.8172,
+		Timestamp: time.Now().Unix(),
+	}
+
+	sendReport(context.Background(), server.Client(), server.URL, "stale-token", "test-vehicle", report, s)
+
+	assert.Equal(t, int64(1), s.failed.Load())
+	assert.True(t, s.unauthorized.Load(), "401 must flag the run as unauthorized so workers stop")
+}
+
+func TestSendReport_RateLimited(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"error":"rate limit exceeded"}`))
+	}))
+	defer server.Close()
+
+	s := &stats{}
+	report := &locationReport{
+		VehicleID: "test-vehicle",
+		Latitude:  -1.2864,
+		Longitude: 36.8172,
+		Timestamp: time.Now().Unix(),
+	}
+
+	sendReport(context.Background(), server.Client(), server.URL, "test-token", "test-vehicle", report, s)
+
+	assert.Equal(t, int64(1), s.rateLimited.Load())
+	assert.Equal(t, int64(0), s.failed.Load(), "429 is expected backpressure, not a failure")
+	assert.Equal(t, int64(0), s.succeeded.Load())
+	assert.False(t, s.unauthorized.Load())
+}
+
+func TestSimulateVehicle_StopsAfterUnauthorized(t *testing.T) {
+	var received atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received.Add(1)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+
+	route := []Waypoint{
+		{Lat: -1.2864, Lon: 36.8172},
+		{Lat: -1.2833, Lon: 36.8158},
+	}
+
+	s := &stats{}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	simulateVehicle(ctx, server.Client(), server.URL, "stale-token", "test-sim", route, 20*time.Millisecond, s)
+
+	// The worker returns on the tick after the first 401 rather than retrying
+	// for the full ctx duration, which would be ~100 requests at this interval.
+	assert.LessOrEqual(t, received.Load(), int64(2))
+	assert.True(t, s.unauthorized.Load())
+}
+
+func TestParseTokens(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{"empty", "", nil},
+		{"whitespace only", "   ", nil},
+		{"single", "abc", []string{"abc"}},
+		{"multiple", "abc,def", []string{"abc", "def"}},
+		{"trailing comma", "abc,", []string{"abc"}},
+		{"surrounding space", " abc , def ", []string{"abc", "def"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, parseTokens(tt.in))
+		})
+	}
 }
 
 func TestSendReport_CancelledContext(t *testing.T) {
@@ -269,7 +360,7 @@ func TestSendReport_CancelledContext(t *testing.T) {
 		Timestamp: time.Now().Unix(),
 	}
 
-	sendReport(ctx, http.DefaultClient, "http://localhost:99999", "test-vehicle", report, s)
+	sendReport(ctx, http.DefaultClient, "http://localhost:99999", "test-token", "test-vehicle", report, s)
 
 	// Cancelled context should not count as a failure
 	assert.Equal(t, int64(0), s.succeeded.Load())
@@ -293,7 +384,7 @@ func TestSimulateVehicle(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
 	defer cancel()
 
-	simulateVehicle(ctx, server.Client(), server.URL, "test-sim", route, 100*time.Millisecond, s)
+	simulateVehicle(ctx, server.Client(), server.URL, "test-token", "test-sim", route, 100*time.Millisecond, s)
 
 	assert.Eventually(t, func() bool {
 		return s.succeeded.Load() >= 2
